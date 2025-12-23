@@ -2,7 +2,7 @@ requires 'perl', '5.20.0';
 requires 'Carp';
 requires 'Clone';
 requires 'Dancer2', '1.0.0';
-requires 'OIDC::Client', '1.05';
+requires 'OIDC::Client', '1.06';
 requires 'Scalar::Util';
 requires 'Try::Tiny';
 
