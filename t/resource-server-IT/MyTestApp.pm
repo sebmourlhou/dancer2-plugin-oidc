@@ -2,7 +2,6 @@ package MyTestApp;
 use 5.020;
 use Dancer2;
 use Try::Tiny;
-use Mojo::JSON qw(encode_json);
 
 BEGIN {
   set log => 'error';
@@ -30,7 +29,7 @@ BEGIN {
 
 use Dancer2::Plugin::OIDC;
 
-# client server routes
+# resource server routes
 get('/my-resource' => sub {
       my $user = try {
         my $access_token = oidc->verify_token();
