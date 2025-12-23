@@ -1,7 +1,5 @@
 package Dancer2::Plugin::OIDC;
 use 5.020;
-use strict;
-use warnings;
 use Dancer2::Plugin;
 
 use Carp qw(croak);
@@ -96,7 +94,7 @@ sub BUILD {
   # with several providers
   my $oidc = oidc('my_other_provider');
   # or
-  my $oidc = $c->oidc;  # here, you must define a default provider in the configuration
+  my $oidc = oidc();  # here, you must define a default provider in the configuration
 
 Creates and returns an instance of L<OIDC::Client::Plugin> with the data
 from the current request and session.
@@ -130,15 +128,16 @@ sub oidc {
   }
 
   $plugin = $request->vars->{oidc}{plugin} = OIDC::Client::Plugin->new(
-    log             => $app->logger_engine,
-    request_params  => $request->parameters->as_hashref,
-    request_headers => {@request_headers},
-    session         => $app->session->data,
-    stash           => $request->vars,
-    redirect        => sub { $app->redirect($_[0]); return; },
-    client          => $client,
-    base_url        => $request->base->as_string,
-    current_url     => $request->uri_for($request->path, $request->query_parameters->as_hashref),
+    log                    => $app->logger_engine,
+    request_params         => $request->parameters->as_hashref,
+    request_headers        => {@request_headers},
+    session                => $app->session->data,
+    stash                  => $request->vars,
+    redirect               => sub { $app->redirect($_[0]); return; },
+    client                 => $client,
+    base_url               => $request->base->as_string,
+    current_url            => $request->uri_for($request->path, $request->query_parameters->as_hashref),
+    after_touching_session => sub { $app->session->is_dirty(1) },
   );
 
   return $plugin;
@@ -265,28 +264,20 @@ To setup the plugin when the application is launched :
 
 To authenticate the end-user :
 
-  $app->hook(before_dispatch => sub {
-    my $c = shift;
-
-    my $path = $c->req->url->path;
-
-    # Public routes
-    return if $path =~ m[^/oidc/]
-           || $path =~ m[^/error/];
-
     # Authentication
-    if (my $identity = $c->oidc->get_stored_identity()) {
-      $c->remote_user($identity->{subject});
+    if (oidc->get_valid_identity()) {
+      var user => oidc->build_user_from_identity();
     }
-    elsif (uc($c->req->method) eq 'GET' && !$c->is_ajax_request()) {
-      $c->oidc->redirect_to_authorize();
+    elsif (request->is_get() && !request->is_ajax()) {
+      oidc->redirect_to_authorize();
     }
     else {
-      $c->render(template => 'error',
-                 message  => "You have been logged out. Please try again after refreshing the page.",
-                 status   => 401);
+      Dancer2::Core::Error->new(
+        status   => 401,
+        message  => "You have been logged out. Please try again after refreshing the page.",
+        template => 'error',
+      )->throw();
     }
-  });
 
 =head2 API call
 
@@ -294,79 +285,64 @@ To make an API call with propagation of the security context (token exchange) :
 
   # Retrieving a web client (Mojo::UserAgent object)
   my $ua = try {
-    $c->oidc->build_api_useragent('other_app_name')
+    oidc->build_api_useragent('other_app_name')
   }
   catch {
-    $c->log->warn("Unable to exchange token : $_");
-    $c->render(template => 'error',
-               message  => "Authorization problem. Please try again after refreshing the page.",
-               status   => 403);
-    return;
-  } or return;
+    warning("Unable to exchange token : $_");
+    Dancer2::Core::Error->new(
+      status   => 403,
+      message  => "Authorization problem. Please try again after refreshing the page.",
+      template => 'error',
+    )->throw();
+  };
 
   # Usual call to the API
   my $res = $ua->get($url)->result;
 
 =head2 Resource Server
 
-To check an access token from a Resource Server, assuming it's a JWT token.
-For example, with an application using L<Mojolicious::Plugin::OpenAPI>, you can
-define a security definition that checks that the access token is intended for all
-the expected scopes :
+To check an access token from a Resource Server :
 
-  $app->plugin(OpenAPI => {
-    url      => "data:///swagger.yaml",
-    security => {
-      oidc => sub {
-        my ($c, $definition, $scopes, $cb) = @_;
+  my $access_token = try {
+    return oidc->verify_token();
+  }
+  catch {
+    warning("Token validation : $_");
+    return;
+  } or do {
+    status(401);
+    return encode_json({error => 'Unauthorized'});
+  };
 
-        my $access_token = try {
-          return $c->oidc->verify_token();
-        }
-        catch {
-          $c->log->warn("Token validation : $_");
-          return;
-        } or return $c->$cb("Invalid or incomplete token");
+  unless ($access_token->has_scope($expected_scope)) {
+    warning("Insufficient scopes");
+    status(403);
+    return encode_json({error => 'Forbidden'});
+  }
 
-        foreach my $expected_scope (@$scopes) {
-          unless ($access_token->has_scope($expected_scope)) {
-            return $c->$cb("Insufficient scopes");
-          }
-        }
+  # The token is valid and the user has sufficient scopes
 
-        return $c->$cb();
-      },
-    }
-  });
+To check that the user has an expected role :
 
-Another security definition that checks that the user has at least
-one expected role :
+  my $user = try {
+    my $access_token = oidc->verify_token();
+    return oidc->build_user_from_claims($access_token->claims);
+  }
+  catch {
+    warning("Token/User validation : $_");
+    return;
+  } or do {
+    status(401);
+    return encode_json({error => 'Unauthorized'});
+  };
 
-  $app->plugin(OpenAPI => {
-    url      => "data:///swagger.yaml",
-    security => {
-      oidc => sub {
-        my ($c, $definition, $roles_to_check, $cb) = @_;
+  unless ($user->has_role($expected_role)) {
+    warning("Insufficient roles");
+    status(403);
+    return encode_json({error => 'Forbidden'});
+  }
 
-        my $user = try {
-          my $access_token = $c->oidc->verify_token();
-          return $c->oidc->build_user_from_claims($access_token->claims);
-        }
-        catch {
-          $c->log->warn("Token/User validation : $_");
-          return;
-        } or return $c->$cb('Unauthorized');
-
-        foreach my $role_to_check (@$roles_to_check) {
-          if ($user->has_role($role_to_check)) {
-            return $c->$cb();
-          }
-        }
-
-        return $c->$cb("Insufficient roles");
-      },
-    }
-  });
+  # The token is valid and the user has sufficient roles
 
 =head1 SECURITY RECOMMENDATION
 
@@ -386,5 +362,7 @@ Copyright (C) Sébastien Mourlhou
 This program is free software, you can redistribute it and/or modify it under the terms of the Artistic License version 2.0.
 
 =cut
+
+register_plugin;
 
 1;
